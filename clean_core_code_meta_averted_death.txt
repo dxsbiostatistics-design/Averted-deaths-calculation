@@ -1,0 +1,308 @@
+# ============================================================
+# Core R code for stage-migration meta-analysis and averted-death modelling
+# This script contains two linked parts:
+#   Part 1. Meta-analysis of stage distribution by cancer stage
+#   Part 2. Core calculation of deaths averted by screening
+#
+# NOTE:
+# The file '08_stage_data_intermediate.xlsx' is a manually prepared
+# intermediate file derived from the meta-analysis output and formatted
+# for the averted-death calculation.
+# Please place all required input files in the working directory before running.
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(metafor)
+
+# ============================================================
+# Part 1. Meta-analysis for stage distribution
+# Required input file:
+#   00_stage_distribution_raw.xlsx
+# ============================================================
+
+sheet_cancer_map <- data.frame(
+  sheet_idx = 1:6,
+  cancer_name = c("lung", "female breast", "colorectum", "esophagus", "stomach", "liver cancer")
+)
+
+process_cancer <- function(sheet_idx, cancer_name) {
+  data_raw <- read_excel("00_stage_distribution_raw.xlsx", sheet = sheet_idx)
+
+  data <- data_raw %>%
+    rename(
+      stage_I = `stage I`,
+      stage_II = `stage II`,
+      stage_III = `stage III`,
+      stage_IV = `stage IV`,
+      stage_total = `stage total`
+    ) %>%
+    mutate(study_id = paste0("S", row_number())) %>%
+    filter(stage_total > 0)
+
+  data_long <- data %>%
+    pivot_longer(
+      cols = c(stage_I, stage_II, stage_III, stage_IV),
+      names_to = "stage",
+      values_to = "cases"
+    ) %>%
+    mutate(
+      stage = gsub("stage_", "", stage),
+      cases = ifelse(cases == 0, 0.5, ifelse(cases == stage_total, stage_total - 0.5, cases)),
+      prop = cases / stage_total,
+      logit_prop = log(prop / (1 - prop)),
+      vi = 1 / (stage_total * prop * (1 - prop))
+    ) %>%
+    filter(!is.na(logit_prop) & !is.na(vi))
+
+  meta_func <- function(s, country_filter = NULL) {
+    d <- filter(data_long, stage == s)
+    if (!is.null(country_filter)) d <- filter(d, country == country_filter)
+
+    if (nrow(d) < 1) return(list(pooled_prop = NA, I2 = NA, QEp = NA))
+    if (nrow(d) == 1) return(list(pooled_prop = round(d$prop, 3), I2 = NA, QEp = NA))
+
+    m <- rma(yi = logit_prop, vi = vi, data = d, method = "DL", slab = d$author)
+    return(list(
+      pooled_prop = round(1 / (1 + exp(-m$b)), 3),
+      I2 = round(ifelse(is.na(m$I2), 0, m$I2), 1),
+      QEp = m$QEp
+    ))
+  }
+
+  stages <- c("I", "II", "III", "IV")
+  meta_global <- lapply(stages, function(s) meta_func(s))
+  meta_china <- lapply(stages, function(s) meta_func(s, country_filter = "China"))
+
+  result <- data.frame(
+    cancer = cancer_name,
+    stage = stages,
+    pooled_prop = sapply(meta_global, function(x) x$pooled_prop),
+    I2 = sapply(meta_global, function(x) x$I2),
+    QEp = sapply(meta_global, function(x) x$QEp)
+  ) %>%
+    mutate(
+      pooled_prop_norm = round(pooled_prop / sum(pooled_prop, na.rm = TRUE), 3),
+      pooled_prop_ch = sapply(meta_china, function(x) x$pooled_prop),
+      pooled_prop_norm_ch = round(pooled_prop_ch / sum(pooled_prop_ch, na.rm = TRUE), 3)
+    )
+
+  return(result)
+}
+
+all_cancer_results <- list()
+
+for (i in 1:nrow(sheet_cancer_map)) {
+  sheet_idx <- sheet_cancer_map$sheet_idx[i]
+  cancer_name <- sheet_cancer_map$cancer_name[i]
+  all_cancer_results[[i]] <- process_cancer(sheet_idx, cancer_name)
+}
+
+final_result <- bind_rows(all_cancer_results)
+print(final_result)
+
+# ------------------------------------------------------------
+# Overdiagnosis correction for stage I
+# ------------------------------------------------------------
+reduction_map <- data.frame(
+  cancer = c("lung", "female breast", "colorectum", "esophagus", "stomach", "liver cancer"),
+  i_stage_reduction = c(0.185, 0.19, 0.0416, 0.0416, 0.0416, 0.27),
+  stringsAsFactors = FALSE
+)
+
+correct_overdiagnosis <- function(final_result) {
+  result_with_reduction <- final_result %>%
+    left_join(reduction_map, by = "cancer")
+
+  result_corrected <- result_with_reduction %>%
+    group_by(cancer) %>%
+    mutate(
+      norm_temp = ifelse(stage == "I" & !is.na(i_stage_reduction),
+                         pooled_prop_norm * (1 - i_stage_reduction),
+                         pooled_prop_norm),
+      pooled_prop_norm_corrected = round(norm_temp / sum(norm_temp, na.rm = TRUE), 3),
+
+      norm_ch_temp = ifelse(stage == "I" & !is.na(i_stage_reduction),
+                            pooled_prop_norm_ch * (1 - i_stage_reduction),
+                            pooled_prop_norm_ch),
+      pooled_prop_norm_ch_corrected = round(norm_ch_temp / sum(norm_ch_temp, na.rm = TRUE), 3)
+    ) %>%
+    ungroup() %>%
+    mutate(norm_temp = NULL, norm_ch_temp = NULL)
+
+  return(result_corrected)
+}
+
+final_result_corrected <- correct_overdiagnosis(final_result)
+print(final_result_corrected, n = Inf)
+
+final_result_corrected <- final_result_corrected[, c(1, 2, 4, 5, 3, 6, 10, 7, 8, 11, 9)]
+
+# Optional export
+# writexl::write_xlsx(final_result_corrected, "01_stage_distribution_meta_corrected.xlsx")
+
+
+# ============================================================
+# Part 2. Averted-death calculation
+# Required input file:
+#   08_stage_data_intermediate.xlsx
+#
+# IMPORTANT:
+# This is a manually prepared intermediate file derived from
+# the meta-analysis output and formatted for the final modelling.
+# ============================================================
+
+data <- read_excel("08_stage_data_intermediate.xlsx")
+
+data_clean <- data %>%
+  filter(Group %in% c(
+    "Non-screening",
+    "Multi-country screening",
+    "Chinese screening"
+  )) %>%
+  mutate(
+    Group = case_when(
+      Group == "Non-screening" ~ "China_Patient",
+      Group == "Multi-country screening" ~ "Multi_Screen",
+      Group == "Chinese screening" ~ "China_Screen"
+    ),
+    Stage = factor(Stage, c("I", "II", "III", "IV")),
+    Percentage = as.numeric(Percentage)
+  ) %>%
+  replace_na(list(Percentage = 0)) %>%
+  pivot_wider(
+    id_cols = Cancer,
+    names_from = c(Stage, Group),
+    values_from = Percentage,
+    names_sep = "_",
+    names_prefix = "Pct_"
+  )
+
+params <- data.frame(
+  Cancer = c("Esophageal", "Stomach", "Colorectal", "Liver", "Lung", "Female breast"),
+  Num_Can = round(c(241148, 370475, 371200, 296759.8068, 469620.72, 319618)),
+  DR_I = c(0.2892, 0.1569, 0.1147, 0.4212, 0.1092, 0.0499),
+  DR_II = c(0.4718, 0.357, 0.1881, 0.5104, 0.3636, 0.0871),
+  DR_III = c(0.7206, 0.582, 0.3619, 0.7457, 0.7327, 0.2354),
+  DR_IV = c(0.9013, 0.9277, 0.8182, 0.9163, 0.9029, 0.6611),
+  Adherence_Rate = c(0.358, 0.358, 0.1902, 0.7406, 0.33, 0.5136)
+)
+
+result <- data_clean %>%
+  left_join(params, by = "Cancer") %>%
+  filter(!is.na(Num_Can)) %>%
+  mutate(
+    Total_Death_China_Patient = round(Num_Can * (
+      Pct_I_China_Patient * DR_I + Pct_II_China_Patient * DR_II +
+      Pct_III_China_Patient * DR_III + Pct_IV_China_Patient * DR_IV
+    )),
+
+    Total_Death_Multi_Screen = round(Num_Can * (
+      Pct_I_Multi_Screen * DR_I + Pct_II_Multi_Screen * DR_II +
+      Pct_III_Multi_Screen * DR_III + Pct_IV_Multi_Screen * DR_IV
+    )),
+
+    Total_Death_China_Screen = round(Num_Can * (
+      Pct_I_China_Screen * DR_I + Pct_II_China_Screen * DR_II +
+      Pct_III_China_Screen * DR_III + Pct_IV_China_Screen * DR_IV
+    )),
+
+    Death_Multi_Adherent = round(Adherence_Rate * Num_Can * (
+      Pct_I_Multi_Screen * DR_I + Pct_II_Multi_Screen * DR_II +
+      Pct_III_Multi_Screen * DR_III + Pct_IV_Multi_Screen * DR_IV
+    )),
+
+    Death_Multi_NonAdherent = round((1 - Adherence_Rate) * Num_Can * (
+      Pct_I_China_Patient * DR_I + Pct_II_China_Patient * DR_II +
+      Pct_III_China_Patient * DR_III + Pct_IV_China_Patient * DR_IV
+    )),
+
+    Total_Death_Multi_Adherence = Death_Multi_Adherent + Death_Multi_NonAdherent,
+
+    Death_China_Adherent = round(Adherence_Rate * Num_Can * (
+      Pct_I_China_Screen * DR_I + Pct_II_China_Screen * DR_II +
+      Pct_III_China_Screen * DR_III + Pct_IV_China_Screen * DR_IV
+    )),
+
+    Death_China_NonAdherent = round((1 - Adherence_Rate) * Num_Can * (
+      Pct_I_China_Patient * DR_I + Pct_II_China_Patient * DR_II +
+      Pct_III_China_Patient * DR_III + Pct_IV_China_Patient * DR_IV
+    )),
+
+    Total_Death_China_Adherence = Death_China_Adherent + Death_China_NonAdherent,
+
+    Avoid_Death_Multi = Total_Death_China_Patient - Total_Death_Multi_Screen,
+    Avoid_Death_China = Total_Death_China_Patient - Total_Death_China_Screen,
+    Avoid_Death_Multi_Adherence = Total_Death_China_Patient - Total_Death_Multi_Adherence,
+    Avoid_Death_China_Adherence = Total_Death_China_Patient - Total_Death_China_Adherence,
+
+    Death_Reduction_Pct_Multi = (Avoid_Death_Multi / Total_Death_China_Patient) * 100,
+    Death_Reduction_Pct_China = (Avoid_Death_China / Total_Death_China_Patient) * 100,
+    Death_Reduction_Pct_Multi_Adherence = (Avoid_Death_Multi_Adherence / Total_Death_China_Patient) * 100,
+    Death_Reduction_Pct_China_Adherence = (Avoid_Death_China_Adherence / Total_Death_China_Patient) * 100
+  )
+
+cat("======= Averted-death results under two screening strategies =======\n\n")
+for (i in 1:nrow(result)) {
+  cat("=== Cancer:", result$Cancer[i], "===\n")
+  cat("Incident cases:", result$Num_Can[i], "\n")
+  cat("Screening adherence:", round(result$Adherence_Rate[i] * 100, 0), "%\n")
+  cat("Deaths in non-screening group:", result$Total_Death_China_Patient[i], "\n\n")
+
+  cat("[1] Multi-country screening\n")
+  cat("  Without adherence adjustment:\n")
+  cat("    Deaths:", result$Total_Death_Multi_Screen[i], "\n")
+  cat("    Averted deaths:", result$Avoid_Death_Multi[i], "\n")
+  cat("    Mortality reduction:", round(result$Death_Reduction_Pct_Multi[i], 2), "%\n\n")
+  cat("  With adherence adjustment:\n")
+  cat("    Deaths in adherent group:", result$Death_Multi_Adherent[i], "\n")
+  cat("    Deaths in non-adherent group:", result$Death_Multi_NonAdherent[i], "\n")
+  cat("    Total adjusted deaths:", result$Total_Death_Multi_Adherence[i], "\n")
+  cat("    Averted deaths:", result$Avoid_Death_Multi_Adherence[i], "\n")
+  cat("    Mortality reduction:", round(result$Death_Reduction_Pct_Multi_Adherence[i], 2), "%\n\n")
+
+  cat("[2] China-specific screening\n")
+  cat("  Without adherence adjustment:\n")
+  cat("    Deaths:", result$Total_Death_China_Screen[i], "\n")
+  cat("    Averted deaths:", result$Avoid_Death_China[i], "\n")
+  cat("    Mortality reduction:", round(result$Death_Reduction_Pct_China[i], 2), "%\n\n")
+  cat("  With adherence adjustment:\n")
+  cat("    Deaths in adherent group:", result$Death_China_Adherent[i], "\n")
+  cat("    Deaths in non-adherent group:", result$Death_China_NonAdherent[i], "\n")
+  cat("    Total adjusted deaths:", result$Total_Death_China_Adherence[i], "\n")
+  cat("    Averted deaths:", result$Avoid_Death_China_Adherence[i], "\n")
+  cat("    Mortality reduction:", round(result$Death_Reduction_Pct_China_Adherence[i], 2), "%\n")
+  cat("--------------------------------------------------\n\n")
+}
+
+core_result <- data.frame(
+  Cancer = result$Cancer,
+  Num_Can = result$Num_Can,
+  Adherence_Rate = paste0(round(result$Adherence_Rate * 100, 2), "%"),
+  Total_Death_China_Patient = result$Total_Death_China_Patient,
+
+  Total_Death_Multi_Screen = result$Total_Death_Multi_Screen,
+  Avoid_Death_Multi = result$Avoid_Death_Multi,
+  Death_Reduction_Pct_Multi = paste0(round(result$Death_Reduction_Pct_Multi, 2), "%"),
+  Death_Multi_Adherent = result$Death_Multi_Adherent,
+  Death_Multi_NonAdherent = result$Death_Multi_NonAdherent,
+  Total_Death_Multi_Adherence = result$Total_Death_Multi_Adherence,
+  Avoid_Death_Multi_Adherence = result$Avoid_Death_Multi_Adherence,
+  Death_Reduction_Pct_Multi_Adherence = paste0(round(result$Death_Reduction_Pct_Multi_Adherence, 2), "%"),
+
+  Total_Death_China_Screen = result$Total_Death_China_Screen,
+  Avoid_Death_China = result$Avoid_Death_China,
+  Death_Reduction_Pct_China = paste0(round(result$Death_Reduction_Pct_China, 2), "%"),
+  Death_China_Adherent = result$Death_China_Adherent,
+  Death_China_NonAdherent = result$Death_China_NonAdherent,
+  Total_Death_China_Adherence = result$Total_Death_China_Adherence,
+  Avoid_Death_China_Adherence = result$Avoid_Death_China_Adherence,
+  Death_Reduction_Pct_China_Adherence = paste0(round(result$Death_Reduction_Pct_China_Adherence, 2), "%")
+)
+
+print("======= Core result table =======")
+print(core_result)
+
+# Optional export
+# writexl::write_xlsx(core_result, "02_averted_death_results.xlsx")
